@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="Frontend/public/white.png" alt="Nextbase" height="60" />
+  <img src="Frontend/public/white.png" alt="Docklet" height="60" />
 </p>
 
 <p align="center">
@@ -7,7 +7,7 @@
 </p>
 
 <p align="center">
-  <a href="#-what-is-nextbase">About</a> ·
+  <a href="#-what-is-docklet">About</a> ·
   <a href="#-features">Features</a> ·
   <a href="#-quick-start">Quick Start</a> ·
   <a href="#-architecture">Architecture</a> ·
@@ -18,9 +18,9 @@
 
 ---
 
-## What is Nextbase?
+## What is Docklet?
 
-**Nextbase** started as a self-hosted PostgreSQL manager. It has since grown into a **complete VPS control panel** — all running inside Docker on your own server with no cloud dependency, no data leaving your machine, and no subscription fees.
+**Docklet** started as a self-hosted PostgreSQL manager. It has since grown into a **complete VPS control panel** — all running inside Docker on your own server with no cloud dependency, no data leaving your machine, and no subscription fees.
 
 From a single browser tab you can:
 
@@ -52,10 +52,15 @@ From a single browser tab you can:
 | Feature | Description |
 |---|---|
 | **VPS Management** | Live CPU, RAM, disk, and network graphs for your entire server |
-| **AI Terminal** | Chat with NVIDIA-hosted LLMs (Llama 3, Mistral, etc.) in a browser terminal |
+| **AI Terminal & Agent** | Chat with AI, utilize Smart Deployment Assistant and analyze logs |
 | **Docker Manager** | View, start, stop, remove containers; inspect images and volumes |
-| **GitHub Auto Deploy** | Paste a public repo URL → Nextbase clones, builds the Dockerfile, starts the container, and assigns a port via HAProxy |
-| **Reverse Proxy Manager** | Map a domain to any running container port. Nextbase writes the nginx config, verifies DNS, and provisions a free Let's Encrypt TLS certificate automatically |
+| **Auto Deploy** | Deploy from public repos, buildpacks, or templates marketplace |
+| **Reverse Proxy & Domains** | Map domains to apps with Traefik routing and SSL termination |
+| **Scheduler** | Run cron jobs, queue workers, and background tasks |
+| **Storage Manager** | Manage persistent volumes with a built-in file browser |
+| **Users** | Authentication, RBAC, Admin Panel, and API Keys / Tokens |
+| **SSH** | Native SSH access configuration |
+| **Redis Cache** | Integrated caching layer support |
 
 ---
 
@@ -74,8 +79,8 @@ From a single browser tab you can:
 ### 1. Clone the repository
 
 ```bash
-git clone https://github.com/rehan3web/nextbase.git nextbase
-cd nextbase
+git clone https://github.com/Docklet-Official/docklet.git docklet
+cd docklet
 ```
 
 ### 2. Create your `.env` file
@@ -91,7 +96,7 @@ DB_NAME=mydb
 DB_USERNAME=myuser
 DB_PASSWORD=StrongPassword123!
 
-# Nextbase admin login (web UI)
+# Docklet admin login (web UI)
 ADMIN_USERNAME=admin
 ADMIN_PASSWORD=SecureAdminPass!
 
@@ -119,47 +124,122 @@ Log in with the `ADMIN_USERNAME` and `ADMIN_PASSWORD` you set in `.env`.
 
 ## Architecture
 
+```text
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                                Your VPS / Server                            │
+│                                                                              │
+│  Browser / User                                                              │
+│        │                                                                     │
+│        ▼                                                                     │
+│  :80 / :443                                                                  │
+│  Traefik Reverse Proxy + SSL + Domains + Routing                             │
+│        │                                                                     │
+│  ┌─────┴───────────────────────────────────────────────────────────────┐      │
+│  │                                                                    │      │
+│  ▼                                                                    ▼      │
+│ :3000                                                          :3001         │
+│ Docklet Frontend                                               Docklet API   │
+│ (React / Vite UI)                                              (Node.js)     │
+│                                                                    │          │
+│                                                                    │          │
+│ ┌────────────────────────────────────────────────────────────────┐ │          │
+│ │                        Core Services                           │ │          │
+│ └────────────────────────────────────────────────────────────────┘ │          │
+│                                                                    │          │
+│   ┌───────────────────────────────┐                                │          │
+│   │ Authentication / RBAC         │                                │          │
+│   │ Admin Panel                   │                                │          │
+│   │ User Management               │                                │          │
+│   │ API Keys / Tokens             │                                │          │
+│   └───────────────────────────────┘                                │          │
+│                                                                    │          │
+│   ┌───────────────────────────────┐                                │          │
+│   │ AI DevOps Agent               │                                │          │
+│   │ AI Terminal                   │                                │          │
+│   │ Smart Deployment Assistant    │                                │          │
+│   │ Logs Analysis                 │                                │          │
+│   └───────────────────────────────┘                                │          │
+│                                                                    │          │
+│   ┌───────────────────────────────┐                                │          │
+│   │ Docker Engine                 │                                │          │
+│   │ Container Manager             │                                │          │
+│   │ Auto Deploy                   │                                │          │
+│   │ Buildpacks / RailPack         │                                │          │
+│   │ No Dockerfile Deployments     │                                │          │
+│   │ Templates Marketplace         │                                │          │
+│   └───────────────────────────────┘                                │          │
+│                                                                    │          │
+│   ┌───────────────────────────────┐                                │          │
+│   │ Scheduler / Cron Jobs         │                                │          │
+│   │ Queue Workers                 │                                │          │
+│   │ Background Tasks              │                                │          │
+│   └───────────────────────────────┘                                │          │
+│                                                                    │          │
+│   ┌───────────────────────────────┐                                │          │
+│   │ Monitoring & Statistics       │                                │          │
+│   │ CPU / RAM / Disk Usage        │                                │          │
+│   │ Network Monitoring            │                                │          │
+│   │ Container Metrics             │                                │          │
+│   │ Visualizer / Charts           │                                │          │
+│   └───────────────────────────────┘                                │          │
+│                                                                    │          │
+│   ┌───────────────────────────────┐                                │          │
+│   │ Backup & Restore              │                                │          │
+│   │ Snapshots                     │                                │          │
+│   │ Automated Backups             │                                │          │
+│   └───────────────────────────────┘                                │          │
+│                                                                    │          │
+│   ┌───────────────────────────────┐                                │          │
+│   │ Storage Manager               │                                │          │
+│   │ Persistent Volumes            │                                │          │
+│   │ File Browser                  │                                │          │
+│   └───────────────────────────────┘                                │          │
+│                                                                    │          │
+│ ┌────────────────────────────────────────────────────────────────┐ │          │
+│ │                       Database Layer                           │ │          │
+│ └────────────────────────────────────────────────────────────────┘ │          │
+│                                                                    │          │
+│        ┌──────────────────────┐         ┌──────────────────────┐   │          │
+│        │ PostgreSQL           │         │ pgBouncer            │   │          │
+│        │ :15432               │◄───────►│ :16543               │   │          │
+│        │ Direct DB            │         │ Connection Pooler    │   │          │
+│        └──────────────────────┘         └──────────────────────┘   │          │
+│                                                                    │          │
+│        ┌──────────────────────┐                                    │          │
+│        │ Redis Cache          │                                    │          │
+│        │ :16379               │                                    │          │
+│        └──────────────────────┘                                    │          │
+│                                                                    │          │
+│   ┌───────────────────────────────┐                                │          │
+│   │ SQL Editor                    │                                │          │
+│   │ Table Editor                  │                                │          │
+│   │ Query Runner                  │                                │          │
+│   │ DB Visualizer                 │                                │          │
+│   └───────────────────────────────┘                                │          │
+│                                                                    │          │
+│ ┌────────────────────────────────────────────────────────────────┐ │          │
+│ │                    Public Access Layer                         │ │          │
+│ └────────────────────────────────────────────────────────────────┘ │          │
+│                                                                    │          │
+│   :5432 ─────► Public PostgreSQL Access                            │          │
+│   :6543 ─────► Public pgBouncer Access                             │          │
+│   :22   ─────► SSH                                                  │          │
+│                                                                    │          │
+│ ┌────────────────────────────────────────────────────────────────┐ │          │
+│ │                     Optional Future Features                   │ │          │
+│ └────────────────────────────────────────────────────────────────┘ │          │
+│                                                                    │          │
+│   • Kubernetes Support                                             │          │
+│   • Multi VPS Clustering                                           │          │
+│   • GitHub/GitLab Integration                                      │          │
+│   • CI/CD Pipelines                                                │          │
+│   • Object Storage (S3 Compatible)                                 │          │
+│   • AI Monitoring Agents                                           │          │
+│   • Multi Tenant Workspaces                                        │          │
+│   • One Command Installer                                          │          │
+│                                                                    │          │
+└──────────────────────────────────────────────────────────────────────────────┘
 ```
-                 ┌─────────────────────────────────────────────────────┐
-                 │                     Your Server                      │
-                 │                                                       │
-  Browser ──────►  :3000   Nextbase Frontend  (React / Vite)           │
-                 │               │                                       │
-                 │               ▼                                       │
-                 │  :3001   Nextbase Backend  (Node / Express)          │
-                 │               │                                       │
-                 │    ┌──────────┼──────────────────────┐               │
-                 │    ▼          ▼           ▼           ▼               │
-                 │  pgBouncer  Postgres   docker.sock   nginx            │
-                 │  :16543     :15432     (Docker API)  :80/:443         │
-                 │                                        │               │
-                 │                              nextbase-haproxy         │
-                 │                              :8000–:8098 (internal)   │
-                 │                                        │               │
-                 │                              Deployed containers      │
-                 │                              (nextbase-apps network)  │
-                 └─────────────────────────────────────────────────────┘
-```
-
-### Reverse Proxy flow (domain → app)
-
-```
-Internet ──► nginx :80/:443 ──► nextbase-haproxy:PORT ──► container:EXPOSE_PORT
-```
-
-nginx and HAProxy communicate over the internal Docker bridge — HAProxy has no publicly exposed ports.
-
-### Service map
-
-| Service | Container | Port | Purpose |
-|---|---|---|---|
-| Frontend | `dbofather-client` | 3000 | React web UI |
-| Backend | `dbofather-server` | 3001 | REST API + Docker control |
-| pgBouncer | `dbofather-pooler` | 16543 | Connection pooler |
-| PostgreSQL | `dbofather-db` | 15432 | Database |
-| DB HAProxy | `dbofather-proxy` | 5432 / 6543 | Public TCP proxy (optional) |
-| App HAProxy | `nextbase-haproxy` | 8000–8098 (internal) | Per-app port proxy |
-| Nginx | `nextbase-nginx` | 80 / 443 | Domain → HTTPS reverse proxy |
 
 ---
 
@@ -172,8 +252,8 @@ All configuration lives in **`.env`** in the project root.
 | `DB_NAME` | PostgreSQL database name | `mydb` |
 | `DB_USERNAME` | PostgreSQL user | `myuser` |
 | `DB_PASSWORD` | PostgreSQL password | `StrongPass!` |
-| `ADMIN_USERNAME` | Nextbase web UI username | `admin` |
-| `ADMIN_PASSWORD` | Nextbase web UI password | `SecurePass!` |
+| `ADMIN_USERNAME` | Docklet web UI username | `admin` |
+| `ADMIN_PASSWORD` | Docklet web UI password | `SecurePass!` |
 | `JWT_SECRET` | Secret for signing login tokens | 64-char random string |
 
 Generate a strong JWT secret:
@@ -214,7 +294,7 @@ Charts for active connections, query throughput, cache hit ratio, and table size
 
 ### Pause / Resume
 
-**Pause** blocks all external connections (`ALLOW_CONNECTIONS false` + pgBouncer stop + active connection kill). **Resume** restores full access. The Nextbase backend remains connected throughout so the UI keeps working.
+**Pause** blocks all external connections (`ALLOW_CONNECTIONS false` + pgBouncer stop + active connection kill). **Resume** restores full access. The Docklet backend remains connected throughout so the UI keeps working.
 
 ### VPS Management
 
@@ -235,7 +315,7 @@ Full Docker control from the browser:
 ### GitHub Auto Deploy
 
 1. Paste any public GitHub repo URL that contains a `Dockerfile`
-2. Nextbase clones it, builds the image, starts the container on the internal `nextbase-apps` network, and assigns an HAProxy port (8000–8098)
+2. Docklet clones it, builds the image, starts the container on the internal `docklet-apps` network, and assigns an HAProxy port (8000–8098)
 3. Watch the live build log stream in the UI
 4. Map a domain to the assigned port via the Reverse Proxy manager
 
@@ -244,7 +324,7 @@ Full Docker control from the browser:
 Turn any deployed container into a public HTTPS endpoint:
 
 1. **Add Domain** — enter your domain (e.g. `app.example.com`) and the HAProxy port the app was assigned
-2. **DNS Verification** — Nextbase checks the domain's A-record matches your server IP
+2. **DNS Verification** — Docklet checks the domain's A-record matches your server IP
 3. **Enable SSL** — runs Certbot (Let's Encrypt) in webroot mode. Certificate is stored in `./letsencrypt/` and nginx is reloaded automatically
 4. Your app is live at `https://app.example.com` — certificate auto-renews
 
@@ -313,8 +393,8 @@ docker logs dbofather-server     # backend API
 docker logs dbofather-client     # frontend
 docker logs dbofather-db         # postgres
 docker logs dbofather-pooler     # pgbouncer
-docker logs nextbase-haproxy     # app proxy
-docker logs nextbase-nginx       # reverse proxy
+docker logs docklet-haproxy      # app proxy
+docker logs docklet-nginx        # reverse proxy
 ```
 
 ---
