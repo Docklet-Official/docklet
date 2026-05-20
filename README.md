@@ -100,6 +100,10 @@ DB_PASSWORD=StrongPassword123!
 ADMIN_USERNAME=admin
 ADMIN_PASSWORD=SecureAdminPass!
 
+# SSL / Security
+ACME_EMAIL=[EMAIL_ADDRESS]
+ENABLE_2FA=true
+
 # JWT secret — generate with: openssl rand -hex 32
 JWT_SECRET=replace_with_a_64_char_random_string
 ```
