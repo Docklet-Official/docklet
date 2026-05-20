@@ -1,0 +1,31 @@
+:80 {
+    encode gzip
+
+    # API requests — handled first, never reach the SPA try_files rewrite
+    handle /api/* {
+        reverse_proxy docklet-server:3001 {
+            header_up Host {host}
+            header_up X-Real-IP {remote_host}
+            header_up X-Forwarded-For {remote_host}
+            header_up X-Forwarded-Proto {scheme}
+        }
+    }
+
+    # Socket.IO (WebSocket upgrade) — handled before SPA fallback
+    handle /socket.io/* {
+        reverse_proxy docklet-server:3001 {
+            header_up Host {host}
+            header_up X-Real-IP {remote_host}
+            header_up X-Forwarded-For {remote_host}
+            header_up Upgrade {http.request.header.Upgrade}
+            header_up Connection {http.request.header.Connection}
+        }
+    }
+
+    # React SPA — catch-all, try_files only runs here (never sees /api/* or /socket.io/*)
+    handle {
+        root * /srv
+        try_files {path} /index.html
+        file_server
+    }
+}

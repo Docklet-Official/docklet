@@ -1,0 +1,663 @@
+import { Queue, Worker, Job } from 'bullmq';
+import { spawn, execSync } from 'child_process';
+import path from 'path';
+import fs from 'fs';
+import https from 'https';
+import { createWriteStream } from 'fs';
+import { emitToUser } from './socket';
+import { getRedis, redisReady } from './redis';
+
+// ── Config ────────────────────────────────────────────────────────────────────
+
+const MAX_PARALLEL = Math.max(1, parseInt(process.env.MAX_PARALLEL_BUILDS || '2', 10));
+const DEPLOY_ROOT  = path.resolve(process.cwd(), '.docklet-deploys');
+const LOG_TTL      = 60 * 60 * 24 * 2; // 48 h
+
+if (!fs.existsSync(DEPLOY_ROOT)) fs.mkdirSync(DEPLOY_ROOT, { recursive: true });
+
+// ── Port registry ─────────────────────────────────────────────────────────────
+
+const PORT_REGISTRY_FILE = path.join(DEPLOY_ROOT, '.port-registry.json');
+interface PortEntry { hostPort: number; containerName: string; containerPort: number; deployId: string; }
+const portRegistry = new Map<string, PortEntry>();
+const usedPorts    = new Set<number>();
+
+function loadPortRegistry() {
+    try {
+        const raw = JSON.parse(fs.readFileSync(PORT_REGISTRY_FILE, 'utf8')) as PortEntry[];
+        for (const e of raw) { portRegistry.set(e.deployId, e); usedPorts.add(e.hostPort); }
+    } catch { /* first run */ }
+}
+function savePortRegistry() {
+    try { fs.writeFileSync(PORT_REGISTRY_FILE, JSON.stringify([...portRegistry.values()], null, 2)); } catch { /* ignore */ }
+}
+function claimPort(): number {
+    let p = 8000;
+    while (usedPorts.has(p) && p < 8099) p++;
+    if (p >= 8099) throw new Error('No free port in 8000–8098');
+    usedPorts.add(p);
+    return p;
+}
+loadPortRegistry();
+
+// ── Deploy record ─────────────────────────────────────────────────────────────
+
+export type BuildMethod = 'docker' | 'railpack';
+export type DeployStatus = 'queued' | 'pending' | 'cloning' | 'building' | 'running' | 'failed' | 'success';
+
+export interface DeployRecord {
+    id: string;
+    repo: string;
+    name: string;
+    ownerId: string;
+    status: DeployStatus;
+    buildMethod?: BuildMethod;
+    queuePosition?: number;
+    startedAt: number;
+    finishedAt?: number;
+    error?: string;
+    hostPort?: number;
+    containerPort?: number;
+    containerName?: string;
+    proxyNetwork?: string;    // set for railpack containers routed via Traefik
+    sourceDir?: string;       // set for zip-upload deploys — skips git clone step
+    logs: { stream: 'stdout' | 'stderr' | 'system'; chunk: string; timestamp: number }[];
+}
+
+export const deployments = new Map<string, DeployRecord>();
+
+// ── Redis log helpers ─────────────────────────────────────────────────────────
+
+function rLogKey(id: string)    { return `build:${id}:logs`; }
+function rStatusKey(id: string) { return `build:${id}:status`; }
+
+function rPushLog(id: string, entry: { stream: string; chunk: string; timestamp: number }) {
+    if (!redisReady()) return;
+    try {
+        const r = getRedis();
+        r.rpush(rLogKey(id), JSON.stringify(entry));
+        r.expire(rLogKey(id), LOG_TTL);
+    } catch { /* ignore */ }
+}
+
+function rSetStatus(id: string, status: string) {
+    if (!redisReady()) return;
+    try { getRedis().set(rStatusKey(id), status, 'EX', LOG_TTL); } catch { /* ignore */ }
+}
+
+export async function redisGetLogs(id: string): Promise<DeployRecord['logs']> {
+    if (!redisReady()) return [];
+    try {
+        const items = await getRedis().lrange(rLogKey(id), 0, -1);
+        return items.map(s => JSON.parse(s));
+    } catch { return []; }
+}
+
+// ── Emit helpers ──────────────────────────────────────────────────────────────
+
+export function emitLog(id: string, stream: 'stdout' | 'stderr' | 'system', chunk: string) {
+    const entry = { stream, chunk, timestamp: Date.now() };
+    const rec = deployments.get(id);
+    if (rec) { rec.logs.push(entry); if (rec.logs.length > 1000) rec.logs.shift(); }
+    rPushLog(id, entry);
+    if (rec?.ownerId) emitToUser(rec.ownerId, 'deploy-log', { id, ...entry });
+}
+
+export function emitStatus(id: string, status: DeployStatus, extra?: Record<string, any>) {
+    const rec = deployments.get(id);
+    if (rec) rec.status = status;
+    rSetStatus(id, status);
+    if (rec?.ownerId) emitToUser(rec.ownerId, 'deploy-status', { id, status, ...extra });
+}
+
+// ── Spawn helper — always inherits full process env so PATH is correct ────────
+
+function runStreamed(id: string, command: string, args: string[], cwd: string): Promise<number> {
+    return new Promise((resolve) => {
+        emitLog(id, 'system', `\n$ ${command} ${args.join(' ')}\n`);
+        const child = spawn(command, args, { cwd, env: process.env });
+        child.stdout.on('data', (d) => emitLog(id, 'stdout', d.toString()));
+        child.stderr.on('data', (d) => emitLog(id, 'stderr', d.toString()));
+        child.on('error', (err) => { emitLog(id, 'stderr', `\n[spawn error: ${err.message}]\n`); resolve(-1); });
+        child.on('close', (code) => resolve(code ?? -1));
+    });
+}
+
+// ── RailPack + mise auto-install ──────────────────────────────────────────────
+// railpack v0.23.0 downloads mise v2026.3.17 to /tmp/railpack/mise/mise-2026.3.17
+// at build time. If that download fails on the VPS (network/permissions) the
+// build errors. We pre-seed the file every backend startup so railpack always
+// finds it without needing to download it itself.
+
+const RAILPACK_VERSION  = 'v0.23.0';
+const RAILPACK_INSTALL  = path.join(process.env.HOME || '/root', '.local', 'bin');
+
+// Exact mise version railpack v0.23.0 expects and the path it checks
+const MISE_VERSION      = '2026.3.17';
+const MISE_RAILPACK_DIR = '/tmp/railpack/mise';
+const MISE_RAILPACK_BIN = path.join(MISE_RAILPACK_DIR, `mise-${MISE_VERSION}`);
+
+// Detect host architecture + libc for binary selection.
+// Alpine uses musl libc — the glibc binary fails with "no such file or directory"
+// because /lib64/ld-linux-x86-64.so.2 (the ELF interpreter) doesn't exist.
+// Railpack itself ships as a musl binary and downloads the musl mise variant on Alpine.
+function isMusl(): boolean {
+    try {
+        // musl systems expose their dynamic linker at a well-known path
+        return fs.existsSync('/lib/ld-musl-x86_64.so.1') ||
+               fs.existsSync('/lib/ld-musl-aarch64.so.1');
+    } catch { return false; }
+}
+
+function hostArch(): string {
+    const cpu  = process.arch === 'arm64' ? 'arm64' : 'x64';
+    const libc = isMusl() ? '-musl' : '';
+    return `linux-${cpu}${libc}`;   // e.g. linux-x64-musl on Alpine
+}
+
+function railpackInPath(): boolean {
+    try { execSync('railpack --version', { stdio: 'ignore', env: process.env }); return true; } catch { return false; }
+}
+
+// Download via wget (reliable in Alpine + most Linux distros); fallback to Node https
+function downloadFile(url: string, dest: string): Promise<void> {
+    // Try wget first — handles redirects, SSL, and large files correctly
+    try {
+        execSync(`wget -q --show-progress -O "${dest}" "${url}" 2>&1`, { stdio: 'pipe', timeout: 120_000 });
+        const size = fs.statSync(dest).size;
+        if (size < 1024) throw new Error(`wget produced suspiciously small file (${size} bytes)`);
+        return Promise.resolve();
+    } catch (wgetErr: any) {
+        // Fallback: Node https with redirect following
+        return new Promise((resolve, reject) => {
+            const follow = (u: string, depth = 0) => {
+                if (depth > 5) { reject(new Error('Too many redirects')); return; }
+                https.get(u, (res) => {
+                    if ([301, 302, 303, 307, 308].includes(res.statusCode!)) {
+                        res.resume(); follow(res.headers.location!, depth + 1); return;
+                    }
+                    if (res.statusCode !== 200) { reject(new Error(`HTTP ${res.statusCode} for ${u}`)); return; }
+                    const file = createWriteStream(dest);
+                    res.pipe(file);
+                    file.on('finish', () => file.close(() => resolve()));
+                    file.on('error', reject);
+                    res.on('error', reject);
+                }).on('error', reject);
+            };
+            follow(url);
+        });
+    }
+}
+
+// Build-time helper: logs to both console and deploy log stream
+function blogLog(id: string, msg: string) {
+    console.log(`[BuildQueue] ${msg}`);
+    emitLog(id, 'system', msg + '\n');
+}
+
+// Pre-seed mise at the exact path railpack expects.
+// /tmp is ephemeral so this must run before each railpack build.
+async function ensureMise(id: string): Promise<void> {
+    // If the file exists, verify it can actually execute (guards against a cached
+    // glibc binary on a musl/Alpine host — exec fails with "no such file or directory"
+    // because the ELF interpreter /lib64/ld-linux-x86-64.so.2 is missing).
+    if (fs.existsSync(MISE_RAILPACK_BIN)) {
+        try {
+            execSync(`"${MISE_RAILPACK_BIN}" --version`, { stdio: 'pipe', timeout: 5000 });
+            blogLog(id, `mise ${MISE_VERSION} ready`);
+            return;
+        } catch {
+            blogLog(id, `Cached mise binary failed exec test (libc mismatch?) — re-downloading...`);
+            try { fs.unlinkSync(MISE_RAILPACK_BIN); } catch { /* ignore */ }
+        }
+    }
+
+    const arch    = hostArch();
+    const miseUrl = `https://github.com/jdx/mise/releases/download/v${MISE_VERSION}/mise-v${MISE_VERSION}-${arch}`;
+    blogLog(id, `Downloading mise ${MISE_VERSION} (${arch})...`);
+
+    // /tmp/railpack might be a stale file from a previous extraction — remove it
+    try {
+        const st = fs.statSync('/tmp/railpack');
+        if (!st.isDirectory()) { fs.unlinkSync('/tmp/railpack'); blogLog(id, 'Removed stale /tmp/railpack file'); }
+    } catch { /* doesn't exist — fine */ }
+
+    fs.mkdirSync(MISE_RAILPACK_DIR, { recursive: true });
+
+    try {
+        await downloadFile(miseUrl, MISE_RAILPACK_BIN);
+        fs.chmodSync(MISE_RAILPACK_BIN, 0o755);
+        // Verify the freshly downloaded binary is executable on this host
+        try {
+            execSync(`"${MISE_RAILPACK_BIN}" --version`, { stdio: 'pipe', timeout: 5000 });
+        } catch (verifyErr: any) {
+            blogLog(id, `ERROR: mise binary exec test failed after download: ${verifyErr.message}`);
+            blogLog(id, `arch=${arch} — check that mise releases include a ${arch} variant`);
+            try { fs.unlinkSync(MISE_RAILPACK_BIN); } catch { /* partial file */ }
+            return;
+        }
+        const sizeMB = (fs.statSync(MISE_RAILPACK_BIN).size / 1_048_576).toFixed(1);
+        blogLog(id, `mise ${MISE_VERSION} ready (${sizeMB} MB) at ${MISE_RAILPACK_BIN}`);
+    } catch (err: any) {
+        blogLog(id, `ERROR: mise download failed — ${err.message}`);
+        try { fs.unlinkSync(MISE_RAILPACK_BIN); } catch { /* partial file */ }
+    }
+}
+
+async function ensureRailpack(id: string): Promise<void> {
+    // Seed mise before checking/installing railpack
+    await ensureMise(id);
+
+    if (railpackInPath()) {
+        blogLog(id, 'railpack already installed');
+        return;
+    }
+
+    const arch        = hostArch();
+    const railpackUrl = `https://github.com/railwayapp/railpack/releases/download/${RAILPACK_VERSION}/railpack-${RAILPACK_VERSION}-x86_64-unknown-linux-musl.tar.gz`;
+    blogLog(id, `Installing railpack ${RAILPACK_VERSION}...`);
+
+    try {
+        fs.mkdirSync(RAILPACK_INSTALL, { recursive: true });
+        const tarPath = path.join(RAILPACK_INSTALL, 'railpack.tar.gz');
+        await downloadFile(railpackUrl, tarPath);
+        execSync(`tar -xzf "${tarPath}" -C "${RAILPACK_INSTALL}"`, { stdio: 'pipe' });
+        fs.unlinkSync(tarPath);
+        fs.chmodSync(path.join(RAILPACK_INSTALL, 'railpack'), 0o755);
+
+        const cur = process.env.PATH || '';
+        if (!cur.includes(RAILPACK_INSTALL)) process.env.PATH = `${RAILPACK_INSTALL}:${cur}`;
+
+        if (railpackInPath()) {
+            blogLog(id, `railpack ${RAILPACK_VERSION} installed`);
+        } else {
+            blogLog(id, 'ERROR: railpack install completed but binary not found in PATH');
+        }
+    } catch (err: any) {
+        blogLog(id, `ERROR: railpack install failed — ${err.message}`);
+    }
+}
+
+// ── BuildKit daemon ───────────────────────────────────────────────────────────
+// railpack build requires a BuildKit daemon and reads BUILDKIT_HOST.
+// We auto-start one as a privileged Docker container (moby/buildkit) if needed.
+
+const BUILDKIT_CONTAINER = 'docklet-buildkit';
+const BUILDKIT_HOST_VAL  = `docker-container://${BUILDKIT_CONTAINER}`;
+
+async function ensureBuildKit(id: string): Promise<void> {
+    // Honour a pre-configured BUILDKIT_HOST (e.g. user set it in compose env)
+    if (process.env.BUILDKIT_HOST) {
+        blogLog(id, `BuildKit host: ${process.env.BUILDKIT_HOST}`);
+        return;
+    }
+
+    // Check if our managed container is already running
+    try {
+        const out = execSync(
+            `docker ps --filter name=${BUILDKIT_CONTAINER} --filter status=running --format '{{.Names}}'`,
+            { stdio: 'pipe', env: process.env }
+        ).toString().trim();
+        if (out.includes(BUILDKIT_CONTAINER)) {
+            blogLog(id, 'BuildKit daemon already running');
+            process.env.BUILDKIT_HOST = BUILDKIT_HOST_VAL;
+            return;
+        }
+    } catch { /* docker call failed — fall through to start attempt */ }
+
+    blogLog(id, 'Starting BuildKit daemon...');
+    try {
+        // Remove any stopped container with the same name so docker run doesn't conflict
+        try { execSync(`docker rm -f ${BUILDKIT_CONTAINER}`, { stdio: 'pipe', env: process.env }); } catch { /* didn't exist */ }
+
+        execSync(
+            `docker run --rm --privileged -d --name ${BUILDKIT_CONTAINER} moby/buildkit`,
+            { stdio: 'pipe', env: process.env, timeout: 60_000 }
+        );
+
+        // Give BuildKit ~2 s to initialise its gRPC socket
+        await new Promise(r => setTimeout(r, 2000));
+
+        process.env.BUILDKIT_HOST = BUILDKIT_HOST_VAL;
+        blogLog(id, `BuildKit daemon started (${BUILDKIT_CONTAINER})`);
+    } catch (err: any) {
+        blogLog(id, `WARNING: could not start BuildKit daemon — ${err.message}`);
+        blogLog(id, 'Tip: set BUILDKIT_HOST in the compose env to use an existing BuildKit socket');
+    }
+}
+
+// ── Build logic ───────────────────────────────────────────────────────────────
+
+// Read the first EXPOSE from a Dockerfile
+function parseExposedPort(dockerfilePath: string): number | null {
+    try {
+        let last: number | null = null;
+        for (const line of fs.readFileSync(dockerfilePath, 'utf8').split('\n')) {
+            const m = line.trim().match(/^EXPOSE\s+(\d+)/i);
+            if (m) last = parseInt(m[1], 10);
+        }
+        return last;
+    } catch { return null; }
+}
+
+// Read the first exposed port from a built Docker image (for railpack images
+// that have no Dockerfile to parse — we inspect the image metadata instead)
+function inspectExposedPort(imageTag: string): number | null {
+    try {
+        const raw = execSync(
+            `docker inspect --format '{{range $p, $_ := .Config.ExposedPorts}}{{$p}} {{end}}' ${imageTag}`,
+            { stdio: 'pipe', env: process.env }
+        ).toString().trim();
+        // raw looks like "80/tcp 443/tcp" — take the first numeric port
+        const m = raw.match(/(\d+)\//);
+        return m ? parseInt(m[1], 10) : null;
+    } catch { return null; }
+}
+
+function dockerAvailable() {
+    try { return fs.existsSync('/var/run/docker.sock'); } catch { return false; }
+}
+
+async function runBuild(id: string) {
+    const record = deployments.get(id);
+    if (!record) return;
+
+    const projectName   = record.name;
+    const cloneDir      = record.sourceDir ?? path.join(DEPLOY_ROOT, `${projectName}-${id}`);
+    const imageTag      = `docklet-${projectName}-${id}`.toLowerCase();
+    const containerName = `nb-${projectName}-${id}`.toLowerCase();
+
+    try {
+        if (record.sourceDir) {
+            // Zip-upload path — source already extracted, skip clone
+            emitStatus(id, 'cloning');
+            emitLog(id, 'system', `Using uploaded source directory: ${cloneDir}\n`);
+        } else {
+            // 1. Clone from Git
+            emitStatus(id, 'cloning');
+            emitLog(id, 'system', `Cloning ${record.repo} into ${cloneDir}\n`);
+            const cloneCode = await runStreamed(id, 'git', ['clone', '--depth', '1', record.repo, cloneDir], DEPLOY_ROOT);
+            if (cloneCode !== 0) {
+                record.error = `git clone failed (exit ${cloneCode})`;
+                record.finishedAt = Date.now();
+                return emitStatus(id, 'failed', { error: record.error });
+            }
+        }
+
+        if (!dockerAvailable()) {
+            record.error = 'Docker socket not found. Mount /var/run/docker.sock.';
+            record.finishedAt = Date.now();
+            emitLog(id, 'stderr', `\n[${record.error}]\n`);
+            return emitStatus(id, 'failed', { error: record.error });
+        }
+
+        // 2. Detect build method
+        const dockerfilePath = path.join(cloneDir, 'Dockerfile');
+        const hasDockerfile  = fs.existsSync(dockerfilePath);
+
+        if (hasDockerfile) {
+            // ── Docker build ──────────────────────────────────────────────────
+            record.buildMethod = 'docker';
+            emitLog(id, 'system', '\nDockerfile found → using Docker build\n');
+
+            const containerPort = parseExposedPort(dockerfilePath);
+            let hostPort: number | null = null;
+            if (containerPort) {
+                try {
+                    hostPort = claimPort();
+                    record.containerPort = containerPort;
+                    record.hostPort      = hostPort;
+                    emitLog(id, 'system', `Detected EXPOSE ${containerPort} → host port ${hostPort}\n`);
+                } catch (e: any) {
+                    emitLog(id, 'system', `Warning: ${e.message} — starting without port binding\n`);
+                }
+            } else {
+                emitLog(id, 'system', 'No EXPOSE in Dockerfile — starting without port binding\n');
+            }
+
+            emitStatus(id, 'building');
+            emitLog(id, 'system', `\nBuilding image ${imageTag}\n`);
+            const buildCode = await runStreamed(id, 'docker', ['build', '-t', imageTag, '.'], cloneDir);
+            if (buildCode !== 0) {
+                if (hostPort) usedPorts.delete(hostPort);
+                record.error = `docker build failed (exit ${buildCode})`;
+                record.finishedAt = Date.now();
+                return emitStatus(id, 'failed', { error: record.error });
+            }
+
+            await _startContainer(id, record, containerName, imageTag, hostPort, containerPort);
+
+        } else {
+            // ── RailPack build ────────────────────────────────────────────────
+            record.buildMethod = 'railpack';
+            emitLog(id, 'system', '\nNo Dockerfile found → using RailPack auto-detect build\n');
+
+            // Ensure railpack binary + mise are ready (build-time only — not at startup)
+            await ensureRailpack(id);
+
+            if (!railpackInPath()) {
+                record.error = 'railpack not available — install failed';
+                record.finishedAt = Date.now();
+                emitLog(id, 'stderr', `\n[${record.error}]\n`);
+                return emitStatus(id, 'failed', { error: record.error });
+            }
+
+            // Ensure BuildKit daemon is running — railpack requires BUILDKIT_HOST
+            await ensureBuildKit(id);
+
+            emitStatus(id, 'building');
+            emitLog(id, 'system', `\nRailPack auto-detecting runtime and building image ${imageTag}...\n`);
+            const rpCode = await runStreamed(id, 'railpack', ['build', '--name', imageTag, '--progress', 'plain', '.'], cloneDir);
+            if (rpCode !== 0) {
+                record.error = `railpack build failed (exit ${rpCode})`;
+                record.finishedAt = Date.now();
+                return emitStatus(id, 'failed', { error: record.error });
+            }
+
+            emitLog(id, 'system', '\nRailPack build complete — starting container\n');
+
+            // Detect the port the image exposes (railpack bakes this in)
+            // Railpack runtime images don't always set EXPOSE (Caddy omits it).
+            // Fall back to 80 — railpack's default for all Caddy/static sites.
+            const rpPort = inspectExposedPort(imageTag) ?? 80;
+            record.containerPort = rpPort;
+            emitLog(id, 'system', `Container port ${rpPort}${inspectExposedPort(imageTag) ? ' (from image EXPOSE)' : ' (railpack default)'} — routing via Traefik on docklet-apps network\n`);
+
+            // Railpack containers join the Traefik network so the Reverse Proxy
+            // Manager can route a domain → http://containerName:containerPort
+            // without needing a host port binding.
+            await _startContainer(id, record, containerName, imageTag, null, rpPort, 'docklet-apps');
+        }
+
+    } catch (err: any) {
+        record.status     = 'failed';
+        record.error      = err?.message || String(err);
+        record.finishedAt = Date.now();
+        emitLog(id, 'stderr', `\n[deploy failed: ${record.error}]\n`);
+        emitStatus(id, 'failed', { error: record.error });
+    }
+}
+
+async function _startContainer(
+    id: string, record: DeployRecord,
+    containerName: string, imageTag: string,
+    hostPort: number | null, containerPort: number | null,
+    network?: string,   // optional Docker network to join (railpack → 'docklet-apps')
+) {
+    emitStatus(id, 'running');
+    emitLog(id, 'system', `\nStarting container ${containerName}\n`);
+    record.containerName = containerName;
+    if (network) record.proxyNetwork = network;
+
+    const runArgs = ['run', '-d', '--name', containerName];
+    if (network)                      runArgs.push('--network', network);
+    if (hostPort && containerPort)    runArgs.push('-p', `${hostPort}:${containerPort}`);
+    runArgs.push(imageTag);
+
+    const runCode = await runStreamed(id, 'docker', runArgs, DEPLOY_ROOT);
+    if (runCode !== 0) {
+        if (hostPort) usedPorts.delete(hostPort);
+        record.error      = `docker run failed (exit ${runCode})`;
+        record.finishedAt = Date.now();
+        return emitStatus(id, 'failed', { error: record.error });
+    }
+
+    if (hostPort && containerPort) {
+        portRegistry.set(id, { hostPort, containerName, containerPort, deployId: id });
+        savePortRegistry();
+    }
+
+    record.status     = 'success';
+    record.finishedAt = Date.now();
+
+    let accessMsg: string;
+    if (hostPort) {
+        accessMsg = ` — accessible on host port ${hostPort}`;
+    } else if (network && containerPort) {
+        accessMsg = ` — on network ${network}, internal port ${containerPort}`;
+    } else {
+        accessMsg = '';
+    }
+    emitLog(id, 'system', `\nDeployment successful: container ${containerName} is running${accessMsg}.\n`);
+    emitStatus(id, 'success', { containerName, imageTag, hostPort, containerPort, proxyNetwork: record.proxyNetwork, buildMethod: record.buildMethod });
+}
+
+// ── Queue system ──────────────────────────────────────────────────────────────
+
+let bullQueue: Queue | null   = null;
+let bullWorker: Worker | null = null;
+
+let memRunning = 0;
+const memQueue: string[] = [];
+
+async function memWorkerRun(id: string) {
+    memRunning++;
+    updateQueuePositions();
+    try { await runBuild(id); } finally {
+        memRunning--;
+        const next = memQueue.shift();
+        if (next) { const r = deployments.get(next); if (r) r.queuePosition = undefined; memWorkerRun(next); }
+        updateQueuePositions();
+    }
+}
+
+function updateQueuePositions() {
+    memQueue.forEach((id, i) => { const r = deployments.get(id); if (r) r.queuePosition = i + 1; });
+}
+
+// ── Startup reconciliation ────────────────────────────────────────────────────
+// After a server restart the in-memory `deployments` Map is empty, but railpack
+// containers (named nb-*) may still be running on the docklet-apps network.
+// This scans Docker and re-creates synthetic DeployRecords so the Reverse Proxy
+// dropdown keeps showing them without requiring a new deploy.
+
+async function reconcileRunningContainers(): Promise<void> {
+    try {
+        const { execSync: exec } = await import('child_process');
+        // List all running containers whose name starts with nb-
+        const raw = exec(
+            `docker ps --filter "name=nb-" --format "{{.Names}}\t{{.Image}}"`,
+            { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }
+        ).trim();
+        if (!raw) return;
+
+        let restored = 0;
+        for (const line of raw.split('\n')) {
+            const [containerName, imageName] = line.split('\t');
+            if (!containerName || !containerName.startsWith('nb-')) continue;
+            // Skip if we already have a live record for this container
+            const existing = Array.from(deployments.values()).find(d => d.containerName === containerName);
+            if (existing) continue;
+
+            // Derive a stable synthetic ID from the container name
+            const syntheticId = `reconciled_${containerName}`;
+            // Derive display name: strip leading "nb-" and trailing deploy-id suffix
+            // containerName format: nb-{projectName}-{timestamp}_{random}
+            // We strip nb- prefix and use everything up to the last two _-separated parts
+            const withoutPrefix = containerName.replace(/^nb-/, '');
+            const parts = withoutPrefix.split('-');
+            // Last part looks like "1778489332634_6eybj2" — if so, strip it
+            const lastPart = parts[parts.length - 1];
+            const displayName = /^\d{10,}_[a-z0-9]+$/.test(lastPart)
+                ? parts.slice(0, -1).join('-')
+                : withoutPrefix;
+
+            const rec: DeployRecord = {
+                id: syntheticId,
+                repo: imageName ?? '',
+                name: displayName,
+                ownerId: 'system',
+                status: 'success',
+                buildMethod: 'railpack',
+                startedAt: Date.now(),
+                finishedAt: Date.now(),
+                containerName,
+                containerPort: 80,
+                proxyNetwork: 'docklet-apps',
+                logs: [],
+            };
+            deployments.set(syntheticId, rec);
+            restored++;
+        }
+        if (restored > 0) console.log(`[BuildQueue] Reconciled ${restored} running railpack container(s)`);
+    } catch (e: any) {
+        console.warn('[BuildQueue] Container reconciliation skipped:', e.message);
+    }
+}
+
+export async function initBuildQueue(): Promise<void> {
+    // Rediscover railpack containers that survived a server restart
+    await reconcileRunningContainers();
+
+    if (redisReady()) {
+        try {
+            const connOpts = { host: 'docklet-redis', port: 6379 };
+            bullQueue  = new Queue('builds', { connection: connOpts });
+            bullWorker = new Worker('builds', async (job: Job) => {
+                await runBuild(job.data.id);
+            }, { connection: connOpts, concurrency: MAX_PARALLEL });
+
+            bullWorker.on('failed', (job, err) => {
+                if (!job) return;
+                const rec = deployments.get(job.data.id);
+                if (rec && rec.status !== 'failed') {
+                    rec.status = 'failed'; rec.error = err.message; rec.finishedAt = Date.now();
+                    emitStatus(job.data.id, 'failed', { error: err.message });
+                }
+            });
+
+            console.log(`[BuildQueue] BullMQ ready (max ${MAX_PARALLEL} parallel builds)`);
+        } catch (e: any) {
+            console.warn('[BuildQueue] BullMQ init failed — using in-memory queue:', e.message);
+            bullQueue = null; bullWorker = null;
+        }
+    } else {
+        console.log(`[BuildQueue] in-memory queue (max ${MAX_PARALLEL} parallel builds)`);
+    }
+}
+
+export async function enqueueBuild(id: string): Promise<void> {
+    const rec = deployments.get(id);
+    if (!rec) return;
+
+    if (bullQueue) {
+        rec.status = 'queued';
+        rSetStatus(id, 'queued');
+        await bullQueue.add('build', { id }, { attempts: 2, backoff: { type: 'fixed', delay: 5000 } });
+        const waiting = await bullQueue.getWaitingCount();
+        rec.queuePosition = waiting;
+        if (rec.ownerId) emitToUser(rec.ownerId, 'deploy-status', { id, status: 'queued', queuePosition: waiting });
+    } else {
+        if (memRunning < MAX_PARALLEL) {
+            rec.status = 'pending';
+            memWorkerRun(id);
+        } else {
+            rec.status = 'queued';
+            rec.queuePosition = memQueue.length + 1;
+            memQueue.push(id);
+            if (rec.ownerId) emitToUser(rec.ownerId, 'deploy-status', { id, status: 'queued', queuePosition: rec.queuePosition });
+        }
+    }
+}
+
+export { DEPLOY_ROOT, portRegistry, usedPorts };
